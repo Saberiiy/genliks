@@ -33,7 +33,8 @@ set -euo pipefail
 
 CONFIG="${2:-${CONFIG:-/etc/sing-box/config.json}}"   # 第2参数或环境变量 CONFIG 指定路径，默认 /etc/sing-box/config.json
 DOMAIN="${1:-}"
-TAGNAME="${TAGNAME:-$DOMAIN}"                          # 节点名前缀，默认用域名
+DOMAIN_PREFIX="${DOMAIN%%.*}"                          # 节点名前缀默认只取域名第一段，例如 test.xxx.com -> test
+TAGNAME="${TAGNAME:-$DOMAIN_PREFIX}"                    # 节点名前缀，可用环境变量 TAGNAME 覆盖
 
 # ---- 参数与依赖检查 ----
 if [[ -z "$DOMAIN" ]]; then
