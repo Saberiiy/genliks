@@ -5,7 +5,12 @@
 # 功能：
 #   1. 遍历 config.json 里所有 inbounds，自动识别协议类型，生成单条分享链接
 #   2. 生成 Shadowrocket 聚合订阅（多条链接 Base64 打包，导入一次得到全部节点）
-#   3. 生成 Clash Verge 聚合配置（YAML：proxies + proxy-groups）
+#   3. 生成 Clash Verge 聚合配置（YAML：proxies + proxy-groups + rules）
+#
+# 节点命名：协议-端口-关键区分项，便于同协议多节点测试时区分，例如：
+#   arm-vless-443-tcp      arm-vless-8443-ws     arm-hysteria2-443
+#   arm-trojan-443-tcp     arm-ss-8388-aes-256-gcm
+#   —— 名字冲突时自动加 -2/-3 序号，保证 Clash 不会因重名校验失败
 #
 # 当前支持的协议：vless、hysteria2、vmess、trojan、shadowsocks(ss)
 #   —— 不认识的协议会跳过并提示，不会瞎拼错链接
@@ -66,25 +71,38 @@ b64() {
   if base64 --help 2>&1 | grep -q -- '-w'; then base64 -w0; else base64 | tr -d '\n'; fi
 }
 
-# ---- 收集所有单条链接（存进数组，供后面聚合用）----
-declare -a LINKS=()          # 存所有 协议:// 链接
-declare -a CLASH_PROXIES=()  # 存所有 Clash YAML 片段
-declare -a NAMES=()          # 存所有节点名（给 Clash proxy-groups 用）
-SKIPPED=""                   # 记录跳过的协议
+# 名字去重：把候选名写入全局 RESULT_NAME，若已用过则自动追加 -2/-3...
+# （不用 $(...) 调用，否则会在子shell里执行，USED_NAMES 的更新会丢失）
+declare -A USED_NAMES=()
+RESULT_NAME=""
+uniq_name() {
+  local base="$1" name="$1" n=2
+  while [[ -n "${USED_NAMES[$name]:-}" ]]; do
+    name="${base}-${n}"; n=$((n+1))
+  done
+  USED_NAMES["$name"]=1
+  RESULT_NAME="$name"
+}
 
-# 逐个读取 inbound（用 jq 把每个 inbound 压成单行 JSON，循环处理）
+# ---- 收集所有单条链接 ----
+declare -a LINKS=()          # 所有 协议:// 链接
+declare -a CLASH_PROXIES=()  # 所有 Clash YAML 片段
+declare -a NAMES=()          # 所有节点名（给 Clash proxy-groups 用）
+SKIPPED=""                   # 跳过的协议
+
 while IFS= read -r ib; do
   type=$(echo "$ib" | jq -r '.type')
   port=$(echo "$ib" | jq -r '.listen_port // empty')
   sni=$(echo "$ib"  | jq -r '.tls.server_name // empty')
   [[ -z "$sni" ]] && sni="$DOMAIN"
-  name="${TAGNAME}-${type}"
 
   case "$type" in
     vless)
       uuid=$(echo "$ib" | jq -r '.users[0].uuid')
       flow=$(echo "$ib" | jq -r '.users[0].flow // ""')
-      link="vless://${uuid}@${DOMAIN}:${port}?encryption=none&security=tls&sni=${sni}&fp=chrome&type=tcp"
+      net=$(echo "$ib"  | jq -r '.transport.type // "tcp"')   # 传输方式：tcp/ws/grpc...
+      uniq_name "${TAGNAME}-${type}-${port}-${net}"; name="$RESULT_NAME"   # 名字带端口+传输方式
+      link="vless://${uuid}@${DOMAIN}:${port}?encryption=none&security=tls&sni=${sni}&fp=chrome&type=${net}"
       [[ -n "$flow" && "$flow" != "null" ]] && link+="&flow=${flow}"
       link+="#${name}"
       LINKS+=("$link"); NAMES+=("$name")
@@ -94,7 +112,7 @@ while IFS= read -r ib; do
     server: ${DOMAIN}
     port: ${port}
     uuid: ${uuid}
-    network: tcp
+    network: ${net}
     tls: true
     flow: ${flow}
     servername: ${sni}
@@ -106,6 +124,7 @@ YAML
     hysteria2)
       pass=$(echo "$ib" | jq -r '.users[0].password')
       passenc=$(urlencode "$pass")
+      uniq_name "${TAGNAME}-${type}-${port}"; name="$RESULT_NAME"          # Hysteria2 只走 UDP，名字带端口即可
       link="hysteria2://${passenc}@${DOMAIN}:${port}/?sni=${sni}#${name}"
       LINKS+=("$link"); NAMES+=("$name")
       CLASH_PROXIES+=("$(cat <<YAML
@@ -120,10 +139,11 @@ YAML
       ;;
 
     vmess)
-      # vmess 链接是一段 JSON 再 base64，字段名固定
       uuid=$(echo "$ib" | jq -r '.users[0].uuid')
-      vmess_json=$(jq -nc --arg add "$DOMAIN" --arg port "$port" --arg id "$uuid" --arg sni "$sni" --arg ps "$name" \
-        '{v:"2",ps:$ps,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:"tcp",type:"none",host:"",path:"",tls:"tls",sni:$sni}')
+      net=$(echo "$ib"  | jq -r '.transport.type // "tcp"')
+      uniq_name "${TAGNAME}-${type}-${port}-${net}"; name="$RESULT_NAME"
+      vmess_json=$(jq -nc --arg add "$DOMAIN" --arg port "$port" --arg id "$uuid" --arg sni "$sni" --arg net "$net" --arg ps "$name" \
+        '{v:"2",ps:$ps,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:$net,type:"none",host:"",path:"",tls:"tls",sni:$sni}')
       link="vmess://$(printf '%s' "$vmess_json" | b64)"
       LINKS+=("$link"); NAMES+=("$name")
       CLASH_PROXIES+=("$(cat <<YAML
@@ -134,7 +154,7 @@ YAML
     uuid: ${uuid}
     alterId: 0
     cipher: auto
-    network: tcp
+    network: ${net}
     tls: true
     servername: ${sni}
 YAML
@@ -144,7 +164,9 @@ YAML
     trojan)
       pass=$(echo "$ib" | jq -r '.users[0].password')
       passenc=$(urlencode "$pass")
-      link="trojan://${passenc}@${DOMAIN}:${port}?security=tls&sni=${sni}&type=tcp#${name}"
+      net=$(echo "$ib"  | jq -r '.transport.type // "tcp"')
+      uniq_name "${TAGNAME}-${type}-${port}-${net}"; name="$RESULT_NAME"
+      link="trojan://${passenc}@${DOMAIN}:${port}?security=tls&sni=${sni}&type=${net}#${name}"
       LINKS+=("$link"); NAMES+=("$name")
       CLASH_PROXIES+=("$(cat <<YAML
   - name: ${name}
@@ -152,6 +174,7 @@ YAML
     server: ${DOMAIN}
     port: ${port}
     password: ${pass}
+    network: ${net}
     sni: ${sni}
 YAML
 )")
@@ -160,7 +183,7 @@ YAML
     shadowsocks)
       method=$(echo "$ib" | jq -r '.method')
       pass=$(echo "$ib"   | jq -r '.password')
-      # ss 链接：base64(method:password)@host:port#name
+      uniq_name "${TAGNAME}-${type}-${port}-${method}"; name="$RESULT_NAME" # SS 名字带端口+加密方式
       userinfo=$(printf '%s:%s' "$method" "$pass" | b64)
       link="ss://${userinfo}@${DOMAIN}:${port}#${name}"
       LINKS+=("$link"); NAMES+=("$name")
@@ -199,18 +222,17 @@ echo "【1】单条节点链接（可逐条复制导入）"
 echo "------------------------------------------------------------"
 printf '%s\n' "${LINKS[@]}"
 
-# ---- 产物 2：Shadowrocket 聚合订阅（多条链接 Base64 打包）----
+# ---- 产物 2：Shadowrocket 聚合订阅 ----
 echo
 echo "【2】Shadowrocket 聚合订阅（整段 Base64，导入一次得到全部节点）"
 echo "------------------------------------------------------------"
-# 把所有链接每行一条拼起来，整体 base64
 printf '%s\n' "${LINKS[@]}" | b64
 echo
-echo "（用法：复制上面这串 → Shadowrocket 也可直接当一条节点/订阅粘贴导入）"
+echo "（用法：复制上面这串 → Shadowrocket 当订阅/节点粘贴导入）"
 
-# ---- 产物 3：Clash Verge 聚合配置（YAML）----
+# ---- 产物 3：Clash Verge 聚合配置 ----
 echo
-echo "【3】Clash Verge 聚合配置（保存为 .yaml 导入 / 粘进配置）"
+echo "【3】Clash Verge 聚合配置（保存为 .yaml 导入）"
 echo "------------------------------------------------------------"
 echo "proxies:"
 printf '%s\n' "${CLASH_PROXIES[@]}"
